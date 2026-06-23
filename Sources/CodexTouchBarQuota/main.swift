@@ -162,6 +162,260 @@ enum SnapshotCache {
     }
 }
 
+struct CodexAuthAccount: Equatable {
+    let accountId: String
+    let label: String
+    let fileName: String
+}
+
+enum CodexAuthSwitchError: LocalizedError {
+    case authDirectoryMissing(String)
+    case authFileMissing(String)
+    case invalidSelection(String)
+    case copyFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .authDirectoryMissing(let path):
+            return "找不到 Codex 认证目录：\(path)"
+        case .authFileMissing(let path):
+            return "找不到认证文件：\(path)"
+        case .invalidSelection(let fileName):
+            return "账号文件不可切换：\(fileName)"
+        case .copyFailed(let detail):
+            return "切换账号失败：\(detail)"
+        }
+    }
+}
+
+final class CodexAuthManager {
+    private let fileManager: FileManager
+    private let authDirectoryURL: URL
+    private let authJSONURL: URL
+    private var cachedAccountsByAccountId: [String: CodexAuthAccount] = [:]
+
+    init(
+        fileManager: FileManager = .default,
+        homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) {
+        self.fileManager = fileManager
+        self.authDirectoryURL = homeDirectoryURL.appendingPathComponent(".codex", isDirectory: true)
+        self.authJSONURL = authDirectoryURL.appendingPathComponent("auth.json")
+    }
+
+    func loadAccounts() throws -> (accounts: [CodexAuthAccount], selectedAccountId: String?) {
+        guard fileManager.fileExists(atPath: authDirectoryURL.path) else {
+            throw CodexAuthSwitchError.authDirectoryMissing(authDirectoryURL.path)
+        }
+
+        var accountsByAccountId: [String: CodexAuthAccount] = [:]
+        for authFileURL in try authAccountFileURLs() {
+            guard let account = parseChatGPTAccount(from: authFileURL, requiresChatGPTMode: false) else { continue }
+            let existing = accountsByAccountId[account.accountId]
+            accountsByAccountId[account.accountId] = preferredAccount(existing, account)
+        }
+
+        let currentAuthObject = jsonObject(from: authJSONURL)
+        let currentAccountId = currentAuthObject.flatMap { authStringValue("account_id", in: $0) }
+        let selectedFileName = currentAccountId.map { "auth_\($0).json" }
+
+        if let selectedFileName,
+           let currentAccountId,
+           isSwitchableAuthFileName(selectedFileName),
+           accountsByAccountId[currentAccountId] == nil {
+            let copiedURL = authDirectoryURL.appendingPathComponent(selectedFileName)
+            if !fileManager.fileExists(atPath: copiedURL.path) {
+                try fileManager.copyItem(at: authJSONURL, to: copiedURL)
+            }
+            if let currentAccount = parseChatGPTAccount(from: copiedURL, requiresChatGPTMode: false) {
+                accountsByAccountId[currentAccount.accountId] = currentAccount
+            } else if let currentAccount = parseChatGPTAccount(from: authJSONURL, fileName: selectedFileName, requiresChatGPTMode: false) {
+                accountsByAccountId[currentAccount.accountId] = currentAccount
+            }
+        }
+
+        let accounts = accountsByAccountId.values.sorted {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
+        }
+        cachedAccountsByAccountId = accountsByAccountId
+        return (accounts, currentAccountId)
+    }
+
+    func switchAccount(to fileName: String, now: Date = Date()) throws {
+        guard isSwitchableAuthFileName(fileName) else {
+            throw CodexAuthSwitchError.invalidSelection(fileName)
+        }
+
+        let selectedURL = authDirectoryURL.appendingPathComponent(fileName)
+        guard fileManager.fileExists(atPath: selectedURL.path) else {
+            throw CodexAuthSwitchError.authFileMissing(selectedURL.path)
+        }
+
+        try syncCurrentAuthIfRefreshed()
+
+        let backupURL = uniqueBackupURL(now)
+        let temporaryURL = authDirectoryURL.appendingPathComponent("auth_switch_tmp_\(UUID().uuidString).json")
+
+        do {
+            try fileManager.copyItem(at: selectedURL, to: temporaryURL)
+            if fileManager.fileExists(atPath: authJSONURL.path) {
+                try fileManager.copyItem(at: authJSONURL, to: backupURL)
+                try fileManager.removeItem(at: authJSONURL)
+            }
+            try fileManager.moveItem(at: temporaryURL, to: authJSONURL)
+        } catch {
+            if fileManager.fileExists(atPath: temporaryURL.path) {
+                try? fileManager.removeItem(at: temporaryURL)
+            }
+            if !fileManager.fileExists(atPath: authJSONURL.path),
+               fileManager.fileExists(atPath: backupURL.path) {
+                try? fileManager.copyItem(at: backupURL, to: authJSONURL)
+            }
+            throw CodexAuthSwitchError.copyFailed(error.localizedDescription)
+        }
+    }
+
+    private func syncCurrentAuthIfRefreshed() throws {
+        guard let currentAuthObject = jsonObject(from: authJSONURL) else { return }
+        guard let currentAccountId = authStringValue("account_id", in: currentAuthObject) else { return }
+        guard let currentLastRefresh = authStringValue("last_refresh", in: currentAuthObject) else { return }
+        guard let currentAccount = cachedAccountsByAccountId[currentAccountId] else { return }
+        guard isSwitchableAuthFileName(currentAccount.fileName) else { return }
+
+        let targetURL = authDirectoryURL.appendingPathComponent(currentAccount.fileName)
+        guard fileManager.fileExists(atPath: targetURL.path) else { return }
+
+        guard let targetObject = jsonObject(from: targetURL) else { return }
+        guard authStringValue("account_id", in: targetObject) == currentAccountId else { return }
+
+        let targetLastRefresh = authStringValue("last_refresh", in: targetObject)
+        if targetLastRefresh.map({ currentLastRefresh > $0 }) ?? true {
+            try replaceFile(at: targetURL, withContentsOf: authJSONURL, operationName: "同步当前账号")
+        }
+    }
+
+    private func replaceFile(at targetURL: URL, withContentsOf sourceURL: URL, operationName: String) throws {
+        let temporaryURL = authDirectoryURL.appendingPathComponent("auth_sync_tmp_\(UUID().uuidString).json")
+        do {
+            try fileManager.copyItem(at: sourceURL, to: temporaryURL)
+            if fileManager.fileExists(atPath: targetURL.path) {
+                try fileManager.removeItem(at: targetURL)
+            }
+            try fileManager.moveItem(at: temporaryURL, to: targetURL)
+        } catch {
+            if fileManager.fileExists(atPath: temporaryURL.path) {
+                try? fileManager.removeItem(at: temporaryURL)
+            }
+            throw CodexAuthSwitchError.copyFailed("\(operationName)：\(error.localizedDescription)")
+        }
+    }
+
+    private func authAccountFileURLs() throws -> [URL] {
+        let fileURLs = try fileManager.contentsOfDirectory(
+            at: authDirectoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+
+        return fileURLs.filter { url in
+            let fileName = url.lastPathComponent
+            return fileName.hasPrefix("auth_")
+                && fileName.hasSuffix(".json")
+                && !fileName.hasPrefix("auth_switch_tmp_")
+        }
+    }
+
+    private func parseChatGPTAccount(
+        from url: URL,
+        fileName overrideFileName: String? = nil,
+        requiresChatGPTMode: Bool = true
+    ) -> CodexAuthAccount? {
+        guard let object = jsonObject(from: url) else { return nil }
+        if requiresChatGPTMode {
+            guard object["auth_mode"] as? String == "chatgpt" else { return nil }
+        }
+        guard let accountId = authStringValue("account_id", in: object) else { return nil }
+        guard let idToken = authStringValue("id_token", in: object) else { return nil }
+
+        let payload = jwtPayload(from: idToken)
+        let label = (payload?["email"] as? String)
+            ?? (payload?["sub"] as? String)
+            ?? overrideFileName
+            ?? url.lastPathComponent
+
+        return CodexAuthAccount(accountId: accountId, label: label, fileName: overrideFileName ?? url.lastPathComponent)
+    }
+
+    private func preferredAccount(_ lhs: CodexAuthAccount?, _ rhs: CodexAuthAccount) -> CodexAuthAccount {
+        guard let lhs else { return rhs }
+        let canonicalFileName = "auth_\(rhs.accountId).json"
+        if lhs.fileName == canonicalFileName { return lhs }
+        if rhs.fileName == canonicalFileName { return rhs }
+        return lhs.fileName.localizedCaseInsensitiveCompare(rhs.fileName) == .orderedAscending ? lhs : rhs
+    }
+
+    private func jsonObject(from url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any]
+    }
+
+    private func authStringValue(_ key: String, in object: [String: Any]) -> String? {
+        if let value = object[key] as? String {
+            return value
+        }
+        if let tokens = object["tokens"] as? [String: Any],
+           let value = tokens[key] as? String {
+            return value
+        }
+        return nil
+    }
+
+    private func jwtPayload(from token: String) -> [String: Any]? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = payload.count % 4
+        if remainder > 0 {
+            payload += String(repeating: "=", count: 4 - remainder)
+        }
+
+        guard let data = Data(base64Encoded: payload) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any]
+    }
+
+    private func isSwitchableAuthFileName(_ fileName: String) -> Bool {
+        fileName == (fileName as NSString).lastPathComponent
+            && fileName.hasPrefix("auth_")
+            && fileName.hasSuffix(".json")
+            && !fileName.hasPrefix("auth_switch_tmp_")
+    }
+
+    private func backupTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyyMMddHHmmss"
+        return formatter.string(from: date)
+    }
+
+    private func uniqueBackupURL(_ date: Date) -> URL {
+        let baseName = "auth.json.bak-codexswitch-\(backupTimestamp(date))"
+        let baseURL = authDirectoryURL.appendingPathComponent(baseName)
+        guard fileManager.fileExists(atPath: baseURL.path) else { return baseURL }
+
+        for index in 2...999 {
+            let candidateURL = authDirectoryURL.appendingPathComponent("\(baseName)-\(index)")
+            if !fileManager.fileExists(atPath: candidateURL.path) {
+                return candidateURL
+            }
+        }
+
+        return authDirectoryURL.appendingPathComponent("\(baseName)-\(UUID().uuidString)")
+    }
+}
+
 private struct ParsedWindow {
     let limitId: String
     let fieldName: String
@@ -829,7 +1083,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let popover = NSPopover()
     private let quotaViewController = QuotaViewController()
     private let store = RateLimitStore()
+    private let authManager = CodexAuthManager()
     private let alertPresenter = TouchBarAlertPresenter()
+    private var accountOptions: [CodexAuthAccount] = []
+    private var selectedAccountId: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -840,7 +1097,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.title = "Codex --%"
             button.imagePosition = .imageLeading
             button.target = self
-            button.action = #selector(togglePopover(_:))
+            button.action = #selector(handleStatusItemClick(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         popover.behavior = .transient
@@ -865,10 +1123,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quotaViewController.onReminderConfigurationChange = { [weak self] configuration in
             self?.store.updateReminderConfiguration(configuration)
         }
-        quotaViewController.onQuit = {
-            NSApplication.shared.terminate(nil)
-        }
         quotaViewController.applyReminderConfiguration(store.reminderConfiguration)
+        initializeAccountSwitcher()
 
         store.onChange = { [weak self] snapshot, isRefreshing, error, reminder in
             guard let self else { return }
@@ -892,18 +1148,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.start()
     }
 
+    private func initializeAccountSwitcher() {
+        do {
+            let result = try authManager.loadAccounts()
+            accountOptions = result.accounts
+            selectedAccountId = result.selectedAccountId
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            accountOptions = []
+            selectedAccountId = nil
+            quotaViewController.showAccountSwitchStatus(message)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         alertPresenter.dismiss()
         store.stop()
     }
 
-    @objc private func togglePopover(_ sender: Any?) {
+    @objc private func handleStatusItemClick(_ sender: Any?) {
         guard let button = statusItem.button else { return }
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusMenu()
+            return
+        }
+
         if popover.isShown {
             popover.performClose(sender)
         } else {
             showPopover(relativeTo: button)
         }
+    }
+
+    private func showStatusMenu() {
+        guard let button = statusItem.button else { return }
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        let switchItem = NSMenuItem(title: "切换账号", action: nil, keyEquivalent: "")
+        switchItem.submenu = makeAccountSubmenu()
+        menu.addItem(switchItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quitItem = NSMenuItem(title: "退出", action: #selector(quitFromMenu), keyEquivalent: "")
+        quitItem.target = self
+        quitItem.isEnabled = true
+        menu.addItem(quitItem)
+
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY - 2), in: button)
+    }
+
+    private func makeAccountSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        if accountOptions.isEmpty {
+            let noneItem = NSMenuItem(title: "无", action: nil, keyEquivalent: "")
+            noneItem.isEnabled = false
+            submenu.addItem(noneItem)
+            return submenu
+        }
+
+        for account in accountOptions {
+            let item = NSMenuItem(title: account.label, action: #selector(accountMenuItemSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = account.fileName
+            item.state = account.accountId == selectedAccountId ? .on : .off
+            item.isEnabled = true
+            submenu.addItem(item)
+        }
+
+        return submenu
+    }
+
+    @objc private func accountMenuItemSelected(_ sender: NSMenuItem) {
+        guard let fileName = sender.representedObject as? String else { return }
+        do {
+            try authManager.switchAccount(to: fileName)
+            initializeAccountSwitcher()
+            quotaViewController.showAccountSwitchStatus("已切换账号，正在刷新…")
+            store.refresh(force: true)
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            quotaViewController.showAccountSwitchStatus(message)
+        }
+    }
+
+    @objc private func quitFromMenu() {
+        NSApplication.shared.terminate(nil)
     }
 
     private func showPopoverForReminder() {
@@ -925,7 +1259,6 @@ final class QuotaViewController: NSViewController {
     var onMuteReminder: (() -> Void)?
     var onUnmuteAll: (() -> Void)?
     var onReminderConfigurationChange: ((ReminderConfiguration) -> Void)?
-    var onQuit: (() -> Void)?
 
     private let rootView = TouchBarHostingVisualEffectView()
     private let titleLabel = NSTextField(labelWithString: "Codex 余额")
@@ -934,7 +1267,6 @@ final class QuotaViewController: NSViewController {
     private let weeklyRow = QuotaRowView(title: "周限额")
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private var refreshCooldownTimer: Timer?
-    private let quitButton = NSButton(title: "退出", target: nil, action: nil)
     private let reminderEnabledButton = NSButton(checkboxWithTitle: "主动 Touch Bar 提醒", target: nil, action: nil)
     private let warningPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let resetSoonPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -971,6 +1303,10 @@ final class QuotaViewController: NSViewController {
 
     func setUnmuteButtonVisible(_ visible: Bool) {
         unmuteButton.isHidden = !visible
+    }
+
+    func showAccountSwitchStatus(_ message: String) {
+        statusLabel.stringValue = message
     }
 
     func apply(
@@ -1015,10 +1351,6 @@ final class QuotaViewController: NSViewController {
         refreshButton.target = self
         refreshButton.action = #selector(refreshTapped)
 
-        quitButton.bezelStyle = .rounded
-        quitButton.target = self
-        quitButton.action = #selector(quitTapped)
-
         if TouchBarCapability.hasTouchBar {
             configureReminderControls()
         }
@@ -1028,7 +1360,7 @@ final class QuotaViewController: NSViewController {
         headerLeftStack.alignment = .leading
         headerLeftStack.spacing = 2
 
-        let headerRightStack = NSStackView(views: [refreshButton, quitButton])
+        let headerRightStack = NSStackView(views: [refreshButton])
         headerRightStack.orientation = .horizontal
         headerRightStack.alignment = .centerY
         headerRightStack.spacing = 8
@@ -1041,7 +1373,7 @@ final class QuotaViewController: NSViewController {
         let rows = NSStackView(views: [fiveHourRow, weeklyRow])
         rows.orientation = .vertical
         rows.alignment = .leading
-        rows.spacing = 8
+        rows.spacing = 4
 
         var contentViews: [NSView] = [header, rows]
         if TouchBarCapability.hasTouchBar {
@@ -1094,10 +1426,6 @@ final class QuotaViewController: NSViewController {
     @objc private func restoreDefaultsTapped() {
         applyReminderConfiguration(.default)
         onReminderConfigurationChange?(currentReminderConfiguration())
-    }
-
-    @objc private func quitTapped() {
-        onQuit?()
     }
 
     private static func formatFetchedAt(_ date: Date) -> String {
