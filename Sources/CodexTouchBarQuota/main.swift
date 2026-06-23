@@ -51,6 +51,7 @@ struct QuotaBucket: Equatable, Codable {
 struct QuotaSnapshot: Equatable, Codable {
     let fiveHour: QuotaBucket?
     let weekly: QuotaBucket?
+    let resetCreditCount: Int?
     let fetchedAt: Date
 
     var primaryStatusTitle: String {
@@ -602,6 +603,8 @@ final class CodexRateLimitClient {
 
         let fiveHourWindow = chooseFiveHourWindow(from: windows)
         let weeklyWindow = chooseWeeklyWindow(from: windows)
+        let resetCreditCount = (result["rateLimitResetCredits"] as? [String: Any])
+            .flatMap { intValue($0["availableCount"]) }
 
         return QuotaSnapshot(
             fiveHour: fiveHourWindow.map {
@@ -620,6 +623,7 @@ final class CodexRateLimitClient {
                     resetsAt: $0.resetsAt
                 )
             },
+            resetCreditCount: resetCreditCount,
             fetchedAt: Date()
         )
     }
@@ -1103,7 +1107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover.behavior = .transient
         popover.animates = true
-        popover.contentSize = NSSize(width: 460, height: TouchBarCapability.hasTouchBar ? 226 : 136)
+        popover.contentSize = NSSize(width: 460, height: TouchBarCapability.hasTouchBar ? 248 : 158)
         popover.contentViewController = quotaViewController
 
         quotaViewController.onRefresh = { [weak self] in
@@ -1153,12 +1157,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let result = try authManager.loadAccounts()
             accountOptions = result.accounts
             selectedAccountId = result.selectedAccountId
+            quotaViewController.setAccountLabel(currentAccountLabel())
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             accountOptions = []
             selectedAccountId = nil
+            quotaViewController.setAccountLabel(nil)
             quotaViewController.showAccountSwitchStatus(message)
         }
+    }
+
+    private func currentAccountLabel() -> String? {
+        guard let selectedAccountId else { return nil }
+        return accountOptions.first { $0.accountId == selectedAccountId }?.label
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1262,9 +1273,12 @@ final class QuotaViewController: NSViewController {
 
     private let rootView = TouchBarHostingVisualEffectView()
     private let titleLabel = NSTextField(labelWithString: "Codex 余额")
+    private let accountLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "等待刷新")
     private let fiveHourRow = QuotaRowView(title: "5小时")
     private let weeklyRow = QuotaRowView(title: "周限额")
+    private let resetCreditsTitleLabel = NSTextField(labelWithString: "可用重置次数：")
+    private let resetCreditsValueLabel = NSTextField(labelWithString: "--")
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private var refreshCooldownTimer: Timer?
     private let reminderEnabledButton = NSButton(checkboxWithTitle: "主动 Touch Bar 提醒", target: nil, action: nil)
@@ -1286,7 +1300,7 @@ final class QuotaViewController: NSViewController {
         }
         view = rootView
         // 无 Touch Bar 机型只显示额度，不显示提醒设置。
-        preferredContentSize = NSSize(width: 460, height: TouchBarCapability.hasTouchBar ? 226 : 136)
+        preferredContentSize = NSSize(width: 460, height: TouchBarCapability.hasTouchBar ? 248 : 158)
 
         configureSubviews()
     }
@@ -1309,6 +1323,11 @@ final class QuotaViewController: NSViewController {
         statusLabel.stringValue = message
     }
 
+    func setAccountLabel(_ text: String?) {
+        accountLabel.stringValue = text ?? ""
+        accountLabel.isHidden = text == nil
+    }
+
     func apply(
         snapshot: QuotaSnapshot?,
         isRefreshing: Bool,
@@ -1318,6 +1337,7 @@ final class QuotaViewController: NSViewController {
         if let snapshot {
             fiveHourRow.update(bucket: snapshot.fiveHour)
             weeklyRow.update(bucket: snapshot.weekly)
+            resetCreditsValueLabel.stringValue = snapshot.resetCreditCount.map(String.init) ?? "--"
             rootView.touchBarQuotaView.update(snapshot: snapshot, reminder: reminder)
         }
 
@@ -1342,9 +1362,20 @@ final class QuotaViewController: NSViewController {
 
     private func configureSubviews() {
         titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        accountLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        accountLabel.textColor = .secondaryLabelColor
+        accountLabel.lineBreakMode = .byTruncatingMiddle
+        accountLabel.isHidden = accountLabel.stringValue.isEmpty
+
         statusLabel.font = .systemFont(ofSize: 11, weight: .regular)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
+
+        resetCreditsTitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        resetCreditsTitleLabel.textColor = .labelColor
+        resetCreditsValueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        resetCreditsValueLabel.textColor = .labelColor
+        resetCreditsValueLabel.alignment = .left
 
         refreshButton.bezelStyle = .rounded
         refreshButton.toolTip = "手动刷新（60 秒内只能刷新一次）"
@@ -1355,7 +1386,12 @@ final class QuotaViewController: NSViewController {
             configureReminderControls()
         }
 
-        let headerLeftStack = NSStackView(views: [titleLabel, statusLabel])
+        let titleLine = NSStackView(views: [titleLabel, accountLabel])
+        titleLine.orientation = .horizontal
+        titleLine.alignment = .lastBaseline
+        titleLine.spacing = 8
+
+        let headerLeftStack = NSStackView(views: [titleLine, statusLabel])
         headerLeftStack.orientation = .vertical
         headerLeftStack.alignment = .leading
         headerLeftStack.spacing = 2
@@ -1370,7 +1406,8 @@ final class QuotaViewController: NSViewController {
         header.alignment = .centerY
         header.spacing = 12
 
-        let rows = NSStackView(views: [fiveHourRow, weeklyRow])
+        let resetCreditsRow = makeResetCreditsRow()
+        let rows = NSStackView(views: [fiveHourRow, weeklyRow, resetCreditsRow])
         rows.orientation = .vertical
         rows.alignment = .leading
         rows.spacing = 4
@@ -1394,8 +1431,27 @@ final class QuotaViewController: NSViewController {
             content.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 12),
             content.bottomAnchor.constraint(lessThanOrEqualTo: rootView.bottomAnchor, constant: -12),
             content.widthAnchor.constraint(equalToConstant: 424),
-            rows.widthAnchor.constraint(equalTo: content.widthAnchor)
+            rows.widthAnchor.constraint(equalTo: content.widthAnchor),
+            resetCreditsRow.widthAnchor.constraint(equalTo: rows.widthAnchor),
+            titleLine.widthAnchor.constraint(lessThanOrEqualToConstant: 330),
+            accountLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 210)
         ])
+    }
+
+    private func makeResetCreditsRow() -> NSStackView {
+        let row = NSStackView(views: [resetCreditsTitleLabel, resetCreditsValueLabel, NSView()])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 20),
+            resetCreditsTitleLabel.widthAnchor.constraint(equalToConstant: 108),
+            resetCreditsValueLabel.widthAnchor.constraint(equalToConstant: 112)
+        ])
+
+        return row
     }
 
     @objc private func refreshTapped() {
